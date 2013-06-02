@@ -1742,17 +1742,22 @@ class PostgresqlDatabase(object):
         self.field_overrides = dict_update(self.field_overrides, fields or {})
         self.op_overrides = dict_update(self.op_overrides, ops or {})
 
-    def close(self, conn):
+    def put_back_in_pool(self, conn):
         self.pool.put(conn)
 
     def get_thread_local_conn(self):
         return getattr(thread_local, 'db_connection', None)
 
+    def new_conn(self):
+
+        return self.pool.get()
+
     def get_conn(self):
-        conn = getattr(thread_local, 'db_connection', None)
+        conn = self.get_thread_local_conn()
+
         if conn is None:
             logger.info('new connection')
-            return self.pool.get()
+            return self.new_conn()
         logger.info('thread local connection')
         return conn
 
@@ -1793,15 +1798,12 @@ class PostgresqlDatabase(object):
         finally:
             if conn:
                 #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
-                thread_local = self.get_thread_local_conn()
-                if thread_local is None:
-                    self.pool.put(conn)
+                thread_local_conn = self.get_thread_local_conn()
+                if thread_local_conn is None:
+                    self.put_back_in_pool(conn)
 
     def transaction(self):
         return Transaction(self)
-
-    def shared_connection(self):
-        return SharedConnection(self)
 
     def get_tables(self):
         res = self.execute_sql("""
@@ -1870,7 +1872,8 @@ class PostgresqlDatabase(object):
 class Transaction(object):
     def __init__(self, db):
         self.db = db
-        self.conn = db.get_conn()
+        self.existing_conn = db.get_thread_local_conn()
+        self.conn = db.new_conn()
 
     def __enter__(self):
         self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE)
@@ -1884,26 +1887,11 @@ class Transaction(object):
         else:
             self.conn.commit()
         #remove the connection from the thread local
-        thread_local.db_connection = None
+        thread_local.db_connection = self.existing_conn
         #reset the connection to the default transaction level and put back in the connection pool
         self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        self.db.close(self.conn)
+        self.db.put_back_in_pool(self.conn)
         return success
-
-class SharedConnection(object):
-    def __init__(self, db):
-        self.db = db
-        self.conn = db.get_conn()
-
-    def __enter__(self):
-        thread_local.db_connection = self.conn
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        #remove the connection from the thread local
-        thread_local.db_connection = None
-        #put back in the connection pool
-        self.db.close(self.conn)
-        return True
 
 def shared_db_connection(db):
     """
@@ -1916,13 +1904,18 @@ def shared_db_connection(db):
     """
     def decorator(func):
         def inner(*args, **kwargs):
-            conn = db.get_conn()
-            thread_local.db_connection = conn
+            existing_conn = db.get_thread_local_conn()
+            if not existing_conn:
+                conn = db.new_conn()
+                thread_local.db_connection = conn
+            else:
+                conn = existing_conn
             result = func(*args, **kwargs)
-            #remove the connection from the thread local
-            thread_local.db_connection = None
-            #put back in the connection pool
-            db.close(conn)
+            if not existing_conn:
+                #remove the connection from the thread local
+                thread_local.db_connection = None
+                #put back in the connection pool
+                db.put_back_in_pool(conn)
             return result
         return inner
     return decorator
