@@ -17,6 +17,10 @@ import sys
 import threading
 from collections import deque, namedtuple
 from copy import deepcopy
+from psycopg2_pool import PostgresConnectionPool
+
+thread_local = threading.local()
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'BigIntegerField',
@@ -27,7 +31,6 @@ __all__ = [
     'DateField',
     'DateTimeField',
     'DecimalField',
-    'DoesNotExist',
     'DoubleField',
     'DQ',
     'Field',
@@ -58,7 +61,8 @@ PY3 = sys.version_info[0] == 3
 if PY3:
     import builtins
     from collections import Callable
-    from functools import reduce
+    from functools import reduce, wraps
+
     callable = lambda c: isinstance(c, Callable)
     unicode_type = str
     string_type = bytes
@@ -95,8 +99,8 @@ except ImportError:
 class ImproperlyConfigured(Exception):
     pass
 
-if sqlite3 is None and psycopg2 is None and mysql is None:
-    raise ImproperlyConfigured('Either sqlite3, psycopg2 or MySQLdb must be installed')
+if psycopg2 is None:
+    raise ImproperlyConfigured('psycopg2 must be installed')
 
 if sqlite3:
     sqlite3.register_adapter(decimal.Decimal, str)
@@ -122,9 +126,6 @@ if psycopg2:
     import psycopg2.extensions
     psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
     psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
-
-# Peewee
-logger = logging.getLogger('peewee')
 
 OP_AND = 0
 OP_OR = 1
@@ -611,7 +612,7 @@ class RelationDescriptor(FieldDescriptor):
                 instance._obj_cache[self.att_name] = obj
             return instance._obj_cache[self.att_name]
         elif not self.field.null:
-            raise self.rel_model.DoesNotExist
+            return None
         return rel_id
 
     def __get__(self, instance, instance_type=None):
@@ -1269,8 +1270,6 @@ class ModelQueryResultWrapper(QueryResultWrapper):
 Join = namedtuple('Join', ('model_class', 'join_type', 'on'))
 
 class Query(Leaf):
-    require_commit = True
-
     def __init__(self, model_class):
         super(Query, self).__init__()
 
@@ -1393,7 +1392,7 @@ class Query(Leaf):
 
     def _execute(self):
         sql, params = self.sql()
-        return self.database.execute_sql(sql, params, self.require_commit)
+        return self.database.execute_sql(sql, params)
 
     def execute(self):
         raise NotImplementedError
@@ -1454,7 +1453,6 @@ class RawQuery(Query):
 class SelectQuery(Query):
     def __init__(self, model_class, *selection):
         super(SelectQuery, self).__init__(model_class)
-        self.require_commit = self.database.commit_select
         self._explicit_selection = len(selection) > 0
         self._select = self._model_shorthand(selection or model_class._meta.get_fields())
         self._group_by = None
@@ -1602,9 +1600,7 @@ class SelectQuery(Query):
         try:
             return clone.execute().next()
         except StopIteration:
-            raise self.model_class.DoesNotExist('instance matching query does not exist:\nSQL: %s\nPARAMS: %s' % (
-                self.sql()
-            ))
+            return None
 
     def first(self):
         res = self.execute()
@@ -1717,69 +1713,48 @@ class DeleteQuery(Query):
         return self.database.rows_affected(self._execute())
 
 
-class Database(object):
-    commit_select = False
+class PostgresqlDatabase(object):
+    commit_select = True
+    field_overrides = {
+        'bigint': 'BIGINT',
+        'blob': 'BYTEA',
+        'bool': 'BOOLEAN',
+        'datetime': 'TIMESTAMP',
+        'decimal': 'NUMERIC',
+        'double': 'DOUBLE PRECISION',
+        'primary_key': 'SERIAL',
+    }
+    for_update = True
+    interpolation = '%s'
+    reserved_tables = ['user']
+    sequences = True
     compiler_class = QueryCompiler
-    field_overrides = {}
-    for_update = False
-    interpolation = '?'
     limit_max = None
     op_overrides = {}
     quote_char = '"'
-    reserved_tables = []
-    sequences = False
     subquery_delete_same_table = True
 
-    def __init__(self, database, threadlocals=False, autocommit=True,
-                 fields=None, ops=None, **connect_kwargs):
-        self.init(database, **connect_kwargs)
-
-        if threadlocals:
-            self.__local = threading.local()
-        else:
-            self.__local = type('DummyLocal', (object,), {})
-
-        self._conn_lock = threading.Lock()
-        self.autocommit = autocommit
-
-        self.field_overrides = dict_update(self.field_overrides, fields or {})
-        self.op_overrides = dict_update(self.op_overrides, ops or {})
-
-    def init(self, database, **connect_kwargs):
-        self.deferred = database is None
+    def __init__(self, database, fields=None, ops=None, **connect_kwargs):
         self.database = database
         self.connect_kwargs = connect_kwargs
 
-    def connect(self):
-        with self._conn_lock:
-            if self.deferred:
-                raise Exception('Error, database not properly initialized before opening connection')
-            self.__local.conn = self._connect(self.database, **self.connect_kwargs)
-            self.__local.closed = False
+        self.pool = PostgresConnectionPool(database, maxsize=15, **connect_kwargs)
+        self.field_overrides = dict_update(self.field_overrides, fields or {})
+        self.op_overrides = dict_update(self.op_overrides, ops or {})
 
-    def close(self):
-        with self._conn_lock:
-            if self.deferred:
-                raise Exception('Error, database not properly initialized before closing connection')
-            self._close(self.__local.conn)
-            self.__local.closed = True
+    def close(self, conn):
+        self.pool.put(conn)
+
+    def get_thread_local_conn(self):
+        return getattr(thread_local, 'db_connection', None)
 
     def get_conn(self):
-        if not hasattr(self.__local, 'closed') or self.__local.closed:
-            self.connect()
-        return self.__local.conn
-
-    def is_closed(self):
-        return getattr(self.__local, 'closed', True)
-
-    def get_cursor(self):
-        return self.get_conn().cursor()
-
-    def _close(self, conn):
-        conn.close()
-
-    def _connect(self, database, **kwargs):
-        raise NotImplementedError
+        conn = getattr(thread_local, 'db_connection', None)
+        if conn is None:
+            logger.info('new connection')
+            return self.pool.get()
+        logger.info('thread local connection')
+        return conn
 
     @classmethod
     def register_fields(cls, fields):
@@ -1790,8 +1765,14 @@ class Database(object):
         cls.op_overrides = dict_update(cls.op_overrides, ops)
 
     def last_insert_id(self, cursor, model):
-        if model._meta.auto_increment:
-            return cursor.lastrowid
+        seq = model._meta.primary_key.sequence
+        if seq:
+            cursor.execute("SELECT CURRVAL('\"%s\"')" % (seq))
+            return cursor.fetchone()[0]
+        elif model._meta.auto_increment:
+            cursor.execute("SELECT CURRVAL('\"%s_%s_seq\"')" % (
+                model._meta.db_table, model._meta.primary_key.db_column))
+            return cursor.fetchone()[0]
 
     def rows_affected(self, cursor):
         return cursor.rowcount
@@ -1801,59 +1782,54 @@ class Database(object):
             self.quote_char, self.interpolation, self.field_overrides,
             self.op_overrides)
 
-    def execute_sql(self, sql, params=None, require_commit=True):
-        cursor = self.get_cursor()
-        res = cursor.execute(sql, params or ())
-        if require_commit and self.get_autocommit():
-            self.commit()
-        logger.debug((sql, params))
-        return cursor
-
-    def begin(self):
-        pass
-
-    def commit(self):
-        self.get_conn().commit()
-
-    def rollback(self):
-        self.get_conn().rollback()
-
-    def set_autocommit(self, autocommit):
-        self.__local.autocommit = autocommit
-
-    def get_autocommit(self):
-        if not hasattr(self.__local, 'autocommit'):
-            self.set_autocommit(self.autocommit)
-        return self.__local.autocommit
+    def execute_sql(self, sql, params=None):
+        conn = None
+        try:
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or ())
+            logger.debug((sql, params))
+            return cursor
+        finally:
+            if conn:
+                #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
+                thread_local = self.get_thread_local_conn()
+                if thread_local is None:
+                    self.pool.put(conn)
 
     def transaction(self):
-        return transaction(self)
+        return Transaction(self)
 
-    def commit_on_success(self, func):
-        def inner(*args, **kwargs):
-            orig = self.get_autocommit()
-            self.set_autocommit(False)
-            self.begin()
-            try:
-                res = func(*args, **kwargs)
-                self.commit()
-            except:
-                self.rollback()
-                raise
-            else:
-                return res
-            finally:
-                self.set_autocommit(orig)
-        return inner
+    def shared_connection(self):
+        return SharedConnection(self)
 
     def get_tables(self):
-        raise NotImplementedError
+        res = self.execute_sql("""
+            SELECT c.relname
+            FROM pg_catalog.pg_class c
+            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'v', '')
+                AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+                AND pg_catalog.pg_table_is_visible(c.oid)
+            ORDER BY c.relname""")
+        return [row[0] for row in res.fetchall()]
 
     def get_indexes_for_table(self, table):
-        raise NotImplementedError
+        res = self.execute_sql("""
+            SELECT c2.relname, i.indisprimary, i.indisunique
+            FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i
+            WHERE c.relname = %s AND c.oid = i.indrelid AND i.indexrelid = c2.oid
+            ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname""", (table,))
+        return sorted([(r[0], r[1]) for r in res.fetchall()])
 
-    def sequence_exists(self, seq):
-        raise NotImplementedError
+    def sequence_exists(self, sequence):
+        res = self.execute_sql("""
+            SELECT COUNT(*)
+            FROM pg_class, pg_namespace
+            WHERE relkind='S'
+                AND pg_class.relnamespace = pg_namespace.oid
+                AND relname=%s""", (sequence,))
+        return bool(res.fetchone()[0])
 
     def create_table(self, model_class, safe=False):
         qc = self.compiler()
@@ -1887,195 +1863,69 @@ class Database(object):
     def extract_date(self, date_part, date_field):
         return fn.EXTRACT(Clause(date_part, R('FROM'), date_field))
 
-
-class SqliteDatabase(Database):
-    limit_max = -1
-    op_overrides = {
-        OP_LIKE: 'GLOB',
-        OP_ILIKE: 'LIKE',
-    }
-
-    def _connect(self, database, **kwargs):
-        if not sqlite3:
-            raise ImproperlyConfigured('sqlite3 must be installed on the system')
-        conn = sqlite3.connect(database, **kwargs)
-        conn.create_function('date_part', 2, _sqlite_date_part)
-        return conn
-
-    def get_indexes_for_table(self, table):
-        res = self.execute_sql('PRAGMA index_list(%s);' % self.quote(table))
-        rows = sorted([(r[1], r[2] == 1) for r in res.fetchall()])
-        return rows
-
-    def get_tables(self):
-        res = self.execute_sql('select name from sqlite_master where type="table" order by name;')
-        return [r[0] for r in res.fetchall()]
-
-    def extract_date(self, date_part, date_field):
-        return fn.date_part(date_part, date_field)
-
-
-class PostgresqlDatabase(Database):
-    commit_select = True
-    field_overrides = {
-        'bigint': 'BIGINT',
-        'blob': 'BYTEA',
-        'bool': 'BOOLEAN',
-        'datetime': 'TIMESTAMP',
-        'decimal': 'NUMERIC',
-        'double': 'DOUBLE PRECISION',
-        'primary_key': 'SERIAL',
-    }
-    for_update = True
-    interpolation = '%s'
-    reserved_tables = ['user']
-    sequences = True
-
-    def _connect(self, database, **kwargs):
-        if not psycopg2:
-            raise ImproperlyConfigured('psycopg2 must be installed on the system')
-        return psycopg2.connect(database=database, **kwargs)
-
-    def last_insert_id(self, cursor, model):
-        seq = model._meta.primary_key.sequence
-        if seq:
-            cursor.execute("SELECT CURRVAL('\"%s\"')" % (seq))
-            return cursor.fetchone()[0]
-        elif model._meta.auto_increment:
-            cursor.execute("SELECT CURRVAL('\"%s_%s_seq\"')" % (
-                model._meta.db_table, model._meta.primary_key.db_column))
-            return cursor.fetchone()[0]
-
-    def get_indexes_for_table(self, table):
-        res = self.execute_sql("""
-            SELECT c2.relname, i.indisprimary, i.indisunique
-            FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i
-            WHERE c.relname = %s AND c.oid = i.indrelid AND i.indexrelid = c2.oid
-            ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname""", (table,))
-        return sorted([(r[0], r[1]) for r in res.fetchall()])
-
-    def get_tables(self):
-        res = self.execute_sql("""
-            SELECT c.relname
-            FROM pg_catalog.pg_class c
-            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'v', '')
-                AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
-                AND pg_catalog.pg_table_is_visible(c.oid)
-            ORDER BY c.relname""")
-        return [row[0] for row in res.fetchall()]
-
-    def sequence_exists(self, sequence):
-        res = self.execute_sql("""
-            SELECT COUNT(*)
-            FROM pg_class, pg_namespace
-            WHERE relkind='S'
-                AND pg_class.relnamespace = pg_namespace.oid
-                AND relname=%s""", (sequence,))
-        return bool(res.fetchone()[0])
-
     def set_search_path(self, *search_path):
         path_params = ','.join(['%s'] * len(search_path))
         self.execute_sql('SET search_path TO %s' % path_params, search_path)
 
-
-class MySQLDatabase(Database):
-    commit_select = True
-    field_overrides = {
-        'bigint': 'BIGINT',
-        'boolean': 'BOOL',
-        'decimal': 'NUMERIC',
-        'double': 'DOUBLE PRECISION',
-        'float': 'FLOAT',
-        'primary_key': 'INTEGER AUTO_INCREMENT',
-        'text': 'LONGTEXT',
-    }
-    for_update = True
-    interpolation = '%s'
-    limit_max = 2 ** 64 - 1  # MySQL quirk
-    op_overrides = {
-        OP_LIKE: 'LIKE BINARY',
-        OP_ILIKE: 'LIKE',
-        OP_XOR: 'XOR',
-    }
-    quote_char = '`'
-    subquery_delete_same_table = False
-
-    def _connect(self, database, **kwargs):
-        if not mysql:
-            raise ImproperlyConfigured('MySQLdb must be installed on the system')
-        conn_kwargs = {
-            'charset': 'utf8',
-            'use_unicode': True,
-        }
-        conn_kwargs.update(kwargs)
-        return mysql.connect(db=database, **conn_kwargs)
-
-    def create_foreign_key(self, model_class, field):
-        compiler = self.compiler()
-        framing = """
-            ALTER TABLE %(table)s ADD CONSTRAINT %(constraint)s
-            FOREIGN KEY (%(field)s) REFERENCES %(to)s(%(to_field)s)%(cascade)s;
-        """
-        db_table = model_class._meta.db_table
-        constraint = 'fk_%s_%s_%s' % (
-            db_table,
-            field.rel_model._meta.db_table,
-            field.db_column,
-        )
-
-        query = framing % {
-            'table': compiler.quote(db_table),
-            'constraint': compiler.quote(constraint),
-            'field': compiler.quote(field.db_column),
-            'to': compiler.quote(field.rel_model._meta.db_table),
-            'to_field': compiler.quote(field.rel_model._meta.primary_key.db_column),
-            'cascade': ' ON DELETE CASCADE' if field.cascade else '',
-        }
-
-        self.execute_sql(query)
-        return super(MySQLDatabase, self).create_foreign_key(model_class, field)
-
-    def get_indexes_for_table(self, table):
-        res = self.execute_sql('SHOW INDEXES IN `%s`;' % table)
-        rows = sorted([(r[2], r[1] == 0) for r in res.fetchall()])
-        return rows
-
-    def get_tables(self):
-        res = self.execute_sql('SHOW TABLES;')
-        return [r[0] for r in res.fetchall()]
-
-    def extract_date(self, date_part, date_field):
-        assert date_part.lower() in DT_LOOKUPS
-        return fn.EXTRACT(Clause(R(date_part), R('FROM'), date_field))
-
-
-class transaction(object):
+class Transaction(object):
     def __init__(self, db):
         self.db = db
+        self.conn = db.get_conn()
 
     def __enter__(self):
-        self._orig = self.db.get_autocommit()
-        self.db.set_autocommit(False)
-        self.db.begin()
+        self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE)
+        thread_local.db_connection = self.conn
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         success = True
         if exc_type:
-            self.db.rollback()
+            self.conn.rollback()
             success = False
         else:
-            self.db.commit()
-        self.db.set_autocommit(self._orig)
+            self.conn.commit()
+        #remove the connection from the thread local
+        thread_local.db_connection = None
+        #reset the connection to the default transaction level and put back in the connection pool
+        self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        self.db.close(self.conn)
         return success
 
+class SharedConnection(object):
+    def __init__(self, db):
+        self.db = db
+        self.conn = db.get_conn()
 
-class DoesNotExist(Exception):
-    pass
+    def __enter__(self):
+        thread_local.db_connection = self.conn
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        #remove the connection from the thread local
+        thread_local.db_connection = None
+        #put back in the connection pool
+        self.db.close(self.conn)
+        return True
 
-default_database = SqliteDatabase('peewee.db')
+def shared_db_connection(db):
+    """
+    Decorator to share a db connection:
 
+        @shared_db_connection(db)
+        def bla():
+            # all db operations will use the same connection here
+
+    """
+    def decorator(func):
+        def inner(*args, **kwargs):
+            conn = db.get_conn()
+            thread_local.db_connection = conn
+            result = func(*args, **kwargs)
+            #remove the connection from the thread local
+            thread_local.db_connection = None
+            #put back in the connection pool
+            db.close(conn)
+            return result
+        return inner
+    return decorator
 
 class ModelOptions(object):
     def __init__(self, cls, database=None, db_table=None, indexes=None,
@@ -2086,7 +1936,7 @@ class ModelOptions(object):
         self.columns = {}
         self.defaults = {}
 
-        self.database = database or default_database
+        self.database = database
         self.db_table = db_table
         self.indexes = indexes or []
         self.order_by = order_by
@@ -2209,8 +2059,6 @@ class BaseModel(type):
             setattr(cls, '__repr__', lambda self: '<%s: %r>' % (
                 cls.__name__, self.__unicode__()))
 
-        exception_class = type('%sDoesNotExist' % cls.__name__, (DoesNotExist,), {})
-        cls.DoesNotExist = exception_class
         cls._meta.prepared()
 
         return cls
@@ -2302,9 +2150,8 @@ class Model(with_metaclass(BaseModel)):
     @classmethod
     def get_or_create(cls, **kwargs):
         sq = cls.select().filter(**kwargs)
-        try:
-            return sq.get()
-        except cls.DoesNotExist:
+        r = sq.get()
+        if r is None:
             return cls.create(**kwargs)
 
     @classmethod
