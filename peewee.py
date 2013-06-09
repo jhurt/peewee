@@ -17,6 +17,7 @@ import sys
 import threading
 from collections import deque, namedtuple
 from copy import deepcopy
+from psycopg2._psycopg import OperationalError, InterfaceError
 from psycopg2_pool import PostgresConnectionPool
 
 thread_local = threading.local()
@@ -1756,9 +1757,9 @@ class PostgresqlDatabase(object):
         conn = self.get_thread_local_conn()
 
         if conn is None:
-            logger.info('new connection')
+            logger.info('new db connection')
             return self.new_conn()
-        logger.info('thread local connection')
+        logger.info('thread local db connection')
         return conn
 
     @classmethod
@@ -1787,20 +1788,30 @@ class PostgresqlDatabase(object):
             self.quote_char, self.interpolation, self.field_overrides,
             self.op_overrides)
 
-    def execute_sql(self, sql, params=None):
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.cursor()
-            cursor.execute(sql, params or ())
-            logger.debug((sql, params))
-            return cursor
-        finally:
-            if conn:
-                #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
-                thread_local_conn = self.get_thread_local_conn()
-                if thread_local_conn is None:
-                    self.put_back_in_pool(conn)
+    def execute_sql(self, sql, params=None, retry_count=3):
+        if retry_count > 0:
+            conn = None
+            try:
+                conn = self.get_conn()
+                cursor = conn.cursor()
+                cursor.execute(sql, params or ())
+                logger.debug((sql, params))
+                return cursor
+            except (OperationalError, InterfaceError):
+                logger.debug('retrying ' + sql)
+                #make sure the connection is not given back to the pool
+                conn = None
+                thread_local.db_connection = None
+                self.pool.closeall()
+                self.execute_sql(sql, params, retry_count - 1)
+            finally:
+                if conn:
+                    #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
+                    thread_local_conn = self.get_thread_local_conn()
+                    if thread_local_conn is None:
+                        self.put_back_in_pool(conn)
+        else:
+            raise OperationalError('Retried ' + sql + ' 3 times')
 
     def transaction(self):
         return Transaction(self)

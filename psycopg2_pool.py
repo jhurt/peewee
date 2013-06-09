@@ -22,6 +22,7 @@ def gevent_wait_callback(conn, timeout=None):
 
 extensions.set_wait_callback(gevent_wait_callback)
 
+
 class DatabaseConnectionPool(object):
 
     def __init__(self, maxsize=100):
@@ -29,18 +30,15 @@ class DatabaseConnectionPool(object):
             raise TypeError('Expected integer, got %r' % (maxsize, ))
         self.maxsize = maxsize
         self.pool = Queue()
-        self.size = 0
 
     def get(self):
         pool = self.pool
-        if self.size >= self.maxsize or pool.qsize():
+        if pool.qsize() >= self.maxsize:
             return pool.get()
         else:
-            self.size += 1
             try:
                 new_item = self.create_connection()
             except:
-                self.size -= 1
                 raise
             return new_item
 
