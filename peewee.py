@@ -52,6 +52,7 @@ __all__ = [
     'SqliteDatabase',
     'TextField',
     'TimeField',
+    'UniqueField'
 ]
 
 # Python 2/3 compat
@@ -1053,6 +1054,11 @@ class QueryCompiler(object):
             parts.append('IF NOT EXISTS')
         parts.append(self.quote(model_class._meta.db_table))
         columns = ', '.join(self.field_sql(f) for f in model_class._meta.get_fields())
+        uniques = model_class._meta.get_uniques()
+        if len(uniques) > 0:
+            columns += ', UNIQUE ('
+            columns += ', '.join(map(lambda x: '"' + x + '"',uniques))
+            columns += ')'
         parts.append('(%s)' % columns)
         return parts
 
@@ -1933,7 +1939,7 @@ def shared_db_connection(db):
 
 class ModelOptions(object):
     def __init__(self, cls, database=None, db_table=None, indexes=None,
-                 order_by=None, primary_key=None):
+                 order_by=None, primary_key=None, uniques=None):
         self.model_class = cls
         self.name = cls.__name__.lower()
         self.fields = {}
@@ -1943,6 +1949,7 @@ class ModelOptions(object):
         self.database = database
         self.db_table = db_table
         self.indexes = indexes or []
+        self.uniques = uniques or []
         self.order_by = order_by
         self.primary_key = primary_key
 
@@ -1983,6 +1990,9 @@ class ModelOptions(object):
     def get_fields(self):
         return [f[1] for f in self.get_sorted_fields()]
 
+    def get_uniques(self):
+        return self.uniques
+
     def rel_for_model(self, model, field_obj=None):
         for field in self.get_fields():
             if isinstance(field, ForeignKeyField) and field.rel_model == model:
@@ -1997,7 +2007,7 @@ class ModelOptions(object):
 
 
 class BaseModel(type):
-    inheritable_options = ['database', 'indexes', 'order_by', 'primary_key']
+    inheritable_options = ['database', 'indexes', 'order_by', 'primary_key', 'uniques']
 
     def __new__(cls, name, bases, attrs):
         if not bases:
