@@ -1819,6 +1819,26 @@ class PostgresqlDatabase(object):
         else:
             raise OperationalError('Retried ' + sql + ' 3 times')
 
+    def execute_many(self, sql, params):
+        conn = None
+        try:
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            cursor.executemany(sql, params)
+            return cursor
+        except (OperationalError, InterfaceError) as e:
+            logger.error(e)
+            #make sure the connection is not given back to the pool
+            conn = None
+            thread_local.db_connection = None
+            self.pool.closeall()
+        finally:
+            if conn:
+                #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
+                thread_local_conn = self.get_thread_local_conn()
+                if thread_local_conn is None:
+                    self.put_back_in_pool(conn)
+
     def transaction(self):
         return Transaction(self)
 
