@@ -7,20 +7,22 @@
 #      ///'
 #     //
 #    '
+
+
 from __future__ import with_statement
+from gevent.local import local
 import datetime
 import decimal
 import logging
 import operator
 import re
 import sys
-import threading
 from collections import deque, namedtuple
 from copy import deepcopy
-from psycopg2._psycopg import OperationalError, InterfaceError
+from psycopg2._psycopg import OperationalError, InterfaceError, TransactionRollbackError
 from psycopg2_pool import PostgresConnectionPool
 
-thread_local = threading.local()
+thread_local = local()
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -79,24 +81,7 @@ else:
         sys.stdout.write(s)
         sys.stdout.write('\n')
 
-# DB libraries
-try:
-    import sqlite3
-except ImportError:
-    sqlite3 = None
-
-try:
-    import psycopg2
-except ImportError:
-    psycopg2 = None
-
-try:
-    import MySQLdb as mysql
-except ImportError:
-    try:
-        import pymysql as mysql
-    except ImportError:
-        mysql = None
+import psycopg2
 
 class ImproperlyConfigured(Exception):
     pass
@@ -104,30 +89,12 @@ class ImproperlyConfigured(Exception):
 if psycopg2 is None:
     raise ImproperlyConfigured('psycopg2 must be installed')
 
-if sqlite3:
-    sqlite3.register_adapter(decimal.Decimal, str)
-    sqlite3.register_adapter(datetime.date, str)
-    sqlite3.register_adapter(datetime.time, str)
-    sqlite3.register_converter('decimal', lambda v: decimal.Decimal(v))
 
-SQLITE_DT_FORMATS = (
-    '%Y-%m-%d %H:%M:%S',
-    '%Y-%m-%d %H:%M:%S.%f',
-    '%Y-%m-%d',
-    '%H:%M:%S',
-    '%H:%M:%S.%f',
-    '%H:%M')
 DT_LOOKUPS = set(['year', 'month', 'day', 'hour', 'minute', 'second'])
 
-def _sqlite_date_part(lookup_type, datetime_string):
-    assert lookup_type in DT_LOOKUPS
-    dt = format_date_time(datetime_string, SQLITE_DT_FORMATS)
-    return getattr(dt, lookup_type)
-
-if psycopg2:
-    import psycopg2.extensions
-    psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
-    psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
+import psycopg2.extensions
+psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
+psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
 
 OP_AND = 0
 OP_OR = 1
@@ -1048,10 +1015,8 @@ class QueryCompiler(object):
             parts.append("DEFAULT NEXTVAL('%s')" % self.quote(field.sequence))
         return ' '.join(p % attrs for p in parts)
 
-    def create_table_sql(self, model_class, safe=False):
-        parts = ['CREATE TABLE']
-        if safe:
-            parts.append('IF NOT EXISTS')
+    def create_table_sql(self, model_class):
+        parts = ['CREATE TABLE IF NOT EXISTS']
         parts.append(self.quote(model_class._meta.db_table))
         columns = ', '.join(self.field_sql(f) for f in model_class._meta.get_fields())
         uniques = model_class._meta.get_uniques()
@@ -1062,8 +1027,8 @@ class QueryCompiler(object):
         parts.append('(%s)' % columns)
         return parts
 
-    def create_table(self, model_class, safe=False):
-        return ' '.join(self.create_table_sql(model_class, safe))
+    def create_table(self, model_class):
+        return ' '.join(self.create_table_sql(model_class))
 
     def drop_table(self, model_class, fail_silently=False, cascade=False):
         parts = ['DROP TABLE']
@@ -1405,12 +1370,17 @@ class Query(Leaf):
         raise NotImplementedError
 
     def scalar(self, as_tuple=False):
-        row = self._execute().fetchone()
-        if row and not as_tuple:
-            return row[0]
-        else:
-            return row
-
+        conn = None
+        try:
+            result = self._execute()
+            row = result[0].fetchone()
+            conn = result[1]
+            if row and not as_tuple:
+                return row[0]
+            else:
+                return row
+        finally:
+            self.database.put_connection_back(conn)
 
 class RawQuery(Query):
     def __init__(self, model, query, *params):
@@ -1450,7 +1420,15 @@ class RawQuery(Query):
                 ResultWrapper = DictQueryResultWrapper
             else:
                 ResultWrapper = NaiveQueryResultWrapper
-            self._qr = ResultWrapper(self.model_class, self._execute(), None)
+            conn = None
+            try:
+                result = self._execute()
+                cursor = result[0]
+                conn = result[1]
+                self._qr = ResultWrapper(self.model_class, cursor, None)
+            finally:
+                self.database.put_connection_back(conn)
+
         return self._qr
 
     def __iter__(self):
@@ -1638,7 +1616,16 @@ class SelectQuery(Query):
             else:
                 query_meta = [self._select, self._joins]
                 ResultWrapper = ModelQueryResultWrapper
-            self._qr = ResultWrapper(self.model_class, self._execute(), query_meta)
+            conn = None
+            try:
+
+                result = self._execute()
+                cursor = result[0]
+                conn = result[1]
+                self._qr = ResultWrapper(self.model_class, cursor, query_meta)
+            finally:
+                self.database.put_connection_back(conn)
+
             self._dirty = False
             return self._qr
         else:
@@ -1686,7 +1673,14 @@ class UpdateQuery(Query):
         return self.compiler().generate_update(self)
 
     def execute(self):
-        return self.database.rows_affected(self._execute())
+        conn = None
+        try:
+            result = self._execute()
+            cursor = result[0]
+            conn = result[1]
+            return self.database.rows_affected(cursor)
+        finally:
+            self.database.put_connection_back(conn)
 
 class InsertQuery(Query):
     def __init__(self, model_class, insert=None):
@@ -1708,7 +1702,15 @@ class InsertQuery(Query):
         return self.compiler().generate_insert(self)
 
     def execute(self):
-        return self.database.last_insert_id(self._execute(), self.model_class)
+        conn = None
+        try:
+            result = self._execute()
+            cursor = result[0]
+            conn = result[1]
+            return self.database.last_insert_id(cursor, self.model_class)
+        finally:
+            self.database.put_connection_back(conn)
+
 
 class DeleteQuery(Query):
     join = not_allowed('joining')
@@ -1717,8 +1719,14 @@ class DeleteQuery(Query):
         return self.compiler().generate_delete(self)
 
     def execute(self):
-        return self.database.rows_affected(self._execute())
-
+        conn = None
+        try:
+            result = self._execute()
+            cursor = result[0]
+            conn = result[1]
+            return self.database.rows_affected(cursor)
+        finally:
+            self.database.put_connection_back(conn)
 
 class PostgresqlDatabase(object):
     commit_select = True
@@ -1745,27 +1753,42 @@ class PostgresqlDatabase(object):
         self.database = database
         self.connect_kwargs = connect_kwargs
 
-        self.pool = PostgresConnectionPool(database, maxsize=15, **connect_kwargs)
+        self.pool = PostgresConnectionPool(database, maxsize=10, **connect_kwargs)
         self.field_overrides = dict_update(self.field_overrides, fields or {})
         self.op_overrides = dict_update(self.op_overrides, ops or {})
 
-    def put_back_in_pool(self, conn):
-        self.pool.put(conn)
-
     def get_thread_local_conn(self):
-        return getattr(thread_local, 'db_connection', None)
+        db_connection = getattr(thread_local, 'db_connection', {})
+        if 'conn' in db_connection:
+            return db_connection['conn']
+        return None
+
+    def set_thread_local_conn(self, conn):
+        db_connection = getattr(thread_local, 'db_connection', {})
+        if not db_connection:
+            setattr(thread_local, 'db_connection', {'conn':conn})
+        else:
+            thread_local.db_connection['conn'] = conn
+
+    def clear_thread_local_conn(self):
+        db_connection = getattr(thread_local, 'db_connection', {})
+        if db_connection:
+            del thread_local.db_connection['conn']
 
     def new_conn(self):
+        conn = self.pool.get()
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        return conn
 
-        return self.pool.get()
+    def new_transaction_conn(self):
+        conn = self.pool.get()
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE)
+        return conn
 
     def get_conn(self):
         conn = self.get_thread_local_conn()
-
         if conn is None:
-            logger.info('new db connection')
             return self.new_conn()
-        logger.info('thread local db connection')
         return conn
 
     @classmethod
@@ -1787,6 +1810,7 @@ class PostgresqlDatabase(object):
             return cursor.fetchone()[0]
 
     def rows_affected(self, cursor):
+
         return cursor.rowcount
 
     def compiler(self):
@@ -1794,30 +1818,30 @@ class PostgresqlDatabase(object):
             self.quote_char, self.interpolation, self.field_overrides,
             self.op_overrides)
 
-    def execute_sql(self, sql, params=None, retry_count=3):
-        if retry_count > 0:
-            conn = None
-            try:
-                conn = self.get_conn()
-                cursor = conn.cursor()
-                cursor.execute(sql, params or ())
-                logger.debug((sql, params))
-                return cursor
-            except (OperationalError, InterfaceError):
-                logger.debug('retrying ' + sql)
-                #make sure the connection is not given back to the pool
-                conn = None
-                thread_local.db_connection = None
-                self.pool.closeall()
-                self.execute_sql(sql, params, retry_count - 1)
-            finally:
-                if conn:
-                    #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
-                    thread_local_conn = self.get_thread_local_conn()
-                    if thread_local_conn is None:
-                        self.put_back_in_pool(conn)
-        else:
-            raise OperationalError('Retried ' + sql + ' 3 times')
+    def put_connection_back(self, conn):
+        if conn:
+            #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
+            thread_local_conn = self.get_thread_local_conn()
+            if thread_local_conn is None:
+                self.pool.put(conn)
+
+    def execute_sql(self, sql, params=None):
+        try:
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or ())
+            #logger.debug((sql, params))
+            return cursor, conn
+        except (OperationalError, InterfaceError) as e:
+            logger.error(e.message)
+            if e.__class__ == TransactionRollbackError:
+                raise e
+            else:
+                thread_local_conn = self.get_thread_local_conn()
+                if thread_local_conn is None:
+                    conn.close()
+                    self.pool.size -= 1
+                raise e
 
     def execute_many(self, sql, params):
         conn = None
@@ -1827,20 +1851,16 @@ class PostgresqlDatabase(object):
             cursor.executemany(sql, params)
             return cursor
         except (OperationalError, InterfaceError) as e:
-            logger.error(e)
-            #make sure the connection is not given back to the pool
-            conn = None
-            thread_local.db_connection = None
-            self.pool.closeall()
-        finally:
-            if conn:
-                #only give the connection back to the pool if it's not a thread local, thread local connections are cleaned up elsewhere
+            if e.__class__ == TransactionRollbackError:
+                raise e
+            else:
                 thread_local_conn = self.get_thread_local_conn()
                 if thread_local_conn is None:
-                    self.put_back_in_pool(conn)
-
-    def transaction(self):
-        return Transaction(self)
+                    conn.close()
+                    self.pool.size -= 1
+                raise e
+        finally:
+            self.put_connection_back(conn)
 
     def get_tables(self):
         res = self.execute_sql("""
@@ -1850,7 +1870,7 @@ class PostgresqlDatabase(object):
             WHERE c.relkind IN ('r', 'v', '')
                 AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
                 AND pg_catalog.pg_table_is_visible(c.oid)
-            ORDER BY c.relname""")
+            ORDER BY c.relname""")[0]
         return [row[0] for row in res.fetchall()]
 
     def get_indexes_for_table(self, table):
@@ -1858,7 +1878,7 @@ class PostgresqlDatabase(object):
             SELECT c2.relname, i.indisprimary, i.indisunique
             FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i
             WHERE c.relname = %s AND c.oid = i.indrelid AND i.indexrelid = c2.oid
-            ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname""", (table,))
+            ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname""", (table,))[0]
         return sorted([(r[0], r[1]) for r in res.fetchall()])
 
     def sequence_exists(self, sequence):
@@ -1867,19 +1887,19 @@ class PostgresqlDatabase(object):
             FROM pg_class, pg_namespace
             WHERE relkind='S'
                 AND pg_class.relnamespace = pg_namespace.oid
-                AND relname=%s""", (sequence,))
+                AND relname=%s""", (sequence,))[0]
         return bool(res.fetchone()[0])
 
-    def create_table(self, model_class, safe=False):
+    def create_table(self, model_class):
         qc = self.compiler()
-        return self.execute_sql(qc.create_table(model_class, safe))
+        return self.execute_sql(qc.create_table(model_class))[0]
 
     def create_index(self, model_class, fields, unique=False):
         qc = self.compiler()
         if not isinstance(fields, (list, tuple)):
             raise ValueError('fields passed to "create_index" must be a list or tuple: "%s"' % fields)
         field_objs = [model_class._meta.fields[f] if isinstance(f, basestring) else f for f in fields]
-        return self.execute_sql(qc.create_index(model_class, field_objs, unique))
+        return self.execute_sql(qc.create_index(model_class, field_objs, unique))[0]
 
     def create_foreign_key(self, model_class, field):
         if not field.primary_key:
@@ -1888,16 +1908,16 @@ class PostgresqlDatabase(object):
     def create_sequence(self, seq):
         if self.sequences:
             qc = self.compiler()
-            return self.execute_sql(qc.create_sequence(seq))
+            return self.execute_sql(qc.create_sequence(seq))[0]
 
     def drop_table(self, model_class, fail_silently=False):
         qc = self.compiler()
-        return self.execute_sql(qc.drop_table(model_class, fail_silently))
+        return self.execute_sql(qc.drop_table(model_class, fail_silently))[0]
 
     def drop_sequence(self, seq):
         if self.sequences:
             qc = self.compiler()
-            return self.execute_sql(qc.drop_sequence(seq))
+            return self.execute_sql(qc.drop_sequence(seq))[0]
 
     def extract_date(self, date_part, date_field):
         return fn.EXTRACT(Clause(date_part, R('FROM'), date_field))
@@ -1906,56 +1926,28 @@ class PostgresqlDatabase(object):
         path_params = ','.join(['%s'] * len(search_path))
         self.execute_sql('SET search_path TO %s' % path_params, search_path)
 
-class Transaction(object):
-    def __init__(self, db):
-        self.db = db
-        self.existing_conn = db.get_thread_local_conn()
-        self.conn = db.new_conn()
-
-    def __enter__(self):
-        self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE)
-        thread_local.db_connection = self.conn
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        success = True
-        if exc_type:
-            self.conn.rollback()
-            success = False
+def doInTransaction(db, body, retry_count=100):
+    conn = db.new_transaction_conn()
+    db.set_thread_local_conn(conn)
+    try:
+        result = body()
+        conn.commit()
+        db.clear_thread_local_conn()
+        db.pool.put(conn)
+    except (OperationalError, InterfaceError) as e:
+        conn.rollback()
+        if e.__class__ == TransactionRollbackError:
+            if retry_count == 0:
+                db.clear_thread_local_conn()
+                db.pool.put(conn)
+                raise e
+            return doInTransaction(db, body, retry_count - 1)
         else:
-            self.conn.commit()
-        #remove the connection from the thread local
-        thread_local.db_connection = self.existing_conn
-        #reset the connection to the default transaction level and put back in the connection pool
-        self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        self.db.put_back_in_pool(self.conn)
-        return success
-
-def shared_db_connection(db):
-    """
-    Decorator to share a db connection:
-
-        @shared_db_connection(db)
-        def bla():
-            # all db operations will use the same connection here
-
-    """
-    def decorator(func):
-        def inner(*args, **kwargs):
-            existing_conn = db.get_thread_local_conn()
-            if not existing_conn:
-                conn = db.new_conn()
-                thread_local.db_connection = conn
-            else:
-                conn = existing_conn
-            result = func(*args, **kwargs)
-            if not existing_conn:
-                #remove the connection from the thread local
-                thread_local.db_connection = None
-                #put back in the connection pool
-                db.put_back_in_pool(conn)
-            return result
-        return inner
-    return decorator
+            conn.close()
+            db.pool.size -= 1
+            logger.error(e.message)
+            raise e
+    return result
 
 class ModelOptions(object):
     def __init__(self, cls, database=None, db_table=None, indexes=None,
@@ -2097,7 +2089,6 @@ class BaseModel(type):
 
         return cls
 
-
 class FieldProxy(Field):
     def __init__(self, alias, field_instance):
         self._model_alias = alias
@@ -2197,17 +2188,21 @@ class Model(with_metaclass(BaseModel)):
         return cls._meta.db_table in cls._meta.database.get_tables()
 
     @classmethod
-    def create_table(cls, fail_silently=False):
-        if fail_silently and cls.table_exists():
-            return
-
+    def create_table(cls):
         db = cls._meta.database
-        pk = cls._meta.primary_key
-        if db.sequences and pk.sequence and not db.sequence_exists(pk.sequence):
-            db.create_sequence(pk.sequence)
+        conn = db.get_conn()
+        try:
+            db.set_thread_local_conn(conn)
+            if not cls.table_exists():
+                pk = cls._meta.primary_key
+                if db.sequences and pk.sequence and not db.sequence_exists(pk.sequence):
+                    db.create_sequence(pk.sequence)
 
-        db.create_table(cls)
-        cls._create_indexes()
+                db.create_table(cls)
+                cls._create_indexes()
+        finally:
+            db.clear_thread_local_conn()
+            db.put_connection_back(conn)
 
     @classmethod
     def _create_indexes(cls):
